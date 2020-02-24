@@ -78,15 +78,15 @@ struct TestDB {
 impl TestDB {
     fn new() -> Self {
         let tmpdir = tempfile::tempdir().expect("Failed to create temporary directory.");
-        let cf_opts_map: ColumnFamilyOptionsMap = [
+        let cf_opts_map: ColumnFamilyOptionsMap = vec![
             (DEFAULT_CF_NAME, ColumnFamilyOptions::default()),
             (
                 TestSchema::COLUMN_FAMILY_NAME,
                 ColumnFamilyOptions::default(),
             ),
         ]
-        .iter()
-        .cloned()
+        .into_iter()
+        // .cloned()
         .collect();
         let db = DB::open(&tmpdir, cf_opts_map).unwrap();
 

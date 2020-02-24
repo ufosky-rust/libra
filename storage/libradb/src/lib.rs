@@ -72,7 +72,7 @@ pub struct LibraDB {
 impl LibraDB {
     /// This creates an empty LibraDB instance on disk or opens one if it already exists.
     pub fn new<P: AsRef<Path> + Clone>(db_root_path: P) -> Self {
-        let cf_opts_map: ColumnFamilyOptionsMap = [
+        let cf_opts_map: ColumnFamilyOptionsMap = vec![
             (
                 /* LedgerInfo CF = */ DEFAULT_CF_NAME,
                 ColumnFamilyOptions::default(),
@@ -91,8 +91,8 @@ impl LibraDB {
             (TRANSACTION_INFO_CF_NAME, ColumnFamilyOptions::default()),
             (VALIDATOR_CF_NAME, ColumnFamilyOptions::default()),
         ]
-        .iter()
-        .cloned()
+        .into_iter()
+            // .cloned()
         .collect();
 
         let path = db_root_path.as_ref().join("libradb");

@@ -32,7 +32,7 @@ pub struct ConsensusDB {
 
 impl ConsensusDB {
     pub fn new<P: AsRef<Path> + Clone>(db_root_path: P) -> Self {
-        let cf_opts_map: ColumnFamilyOptionsMap = [
+        let cf_opts_map: ColumnFamilyOptionsMap = vec![
             (
                 /* UNUSED CF = */ DEFAULT_CF_NAME,
                 ColumnFamilyOptions::default(),
@@ -41,8 +41,8 @@ impl ConsensusDB {
             (QC_CF_NAME, ColumnFamilyOptions::default()),
             (SINGLE_ENTRY_CF_NAME, ColumnFamilyOptions::default()),
         ]
-        .iter()
-        .cloned()
+        .into_iter()
+        // .cloned()
         .collect();
 
         let path = db_root_path.as_ref().join("consensusdb");

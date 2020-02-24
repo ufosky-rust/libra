@@ -16,20 +16,22 @@ pub mod schema;
 
 use crate::schema::{KeyCodec, Schema, SeekKeyCodec, ValueCodec};
 use failure::prelude::*;
-use rocksdb::{
-    rocksdb_options::ColumnFamilyDescriptor, CFHandle, DBOptions, Writable, WriteOptions,
-};
+// use rocksdb::{
+//     rocksdb_options::ColumnFamilyDescriptor, CFHandle, DBOptions, Writable, WriteOptions,
+// };
+use rocksdb::{Options, WriteBatch, WriteOptions, ColumnFamilyDescriptor, ColumnFamily};
+
 use std::{collections::HashMap, iter::Iterator, marker::PhantomData, path::Path};
 
 /// Type alias to `rocksdb::ColumnFamilyOptions`. See [`rocksdb doc`](https://github.com/pingcap/rust-rocksdb/blob/master/src/rocksdb_options.rs)
-pub type ColumnFamilyOptions = rocksdb::ColumnFamilyOptions;
+pub type ColumnFamilyOptions = rocksdb::Options;
 /// Type alias to `rocksdb::ReadOptions`. See [`rocksdb doc`](https://github.com/pingcap/rust-rocksdb/blob/master/src/rocksdb_options.rs)
 pub type ReadOptions = rocksdb::ReadOptions;
 
 /// Type alias to improve readability.
 pub type ColumnFamilyName = &'static str;
 /// Type alias to improve readability.
-pub type ColumnFamilyOptionsMap = HashMap<ColumnFamilyName, ColumnFamilyOptions>;
+pub type ColumnFamilyOptionsMap = HashMap<ColumnFamilyName, Options>;
 
 /// Name for the `default` column family that's always open by RocksDB. We use it to store
 /// [`LedgerInfo`](../types/ledger_info/struct.LedgerInfo.html).
@@ -75,7 +77,7 @@ impl SchemaBatch {
 /// DB Iterator parameterized on [`Schema`] that seeks with [`Schema::Key`] and yields
 /// [`Schema::Key`] and [`Schema::Value`]
 pub struct SchemaIterator<'a, S> {
-    db_iter: rocksdb::DBIterator<&'a rocksdb::DB>,
+    db_iter: rocksdb::DBRawIterator<'a>,
     phantom: PhantomData<S>,
 }
 
@@ -83,7 +85,7 @@ impl<'a, S> SchemaIterator<'a, S>
 where
     S: Schema,
 {
-    fn new(db_iter: rocksdb::DBIterator<&'a rocksdb::DB>) -> Self {
+    fn new(db_iter: rocksdb::DBRawIterator<'a>) -> Self {
         SchemaIterator {
             db_iter,
             phantom: PhantomData,
@@ -92,12 +94,14 @@ where
 
     /// Seeks to the first key.
     pub fn seek_to_first(&mut self) -> bool {
-        self.db_iter.seek(rocksdb::SeekKey::Start)
+        self.db_iter.seek_to_first();
+        self.db_iter.valid()
     }
 
     /// Seeks to the last key.
     pub fn seek_to_last(&mut self) -> bool {
-        self.db_iter.seek(rocksdb::SeekKey::End)
+        self.db_iter.seek_to_last();
+        self.db_iter.valid()
     }
 
     /// Seeks to the first key whose binary representation is equal to or greater than that of the
@@ -107,7 +111,8 @@ where
         SK: SeekKeyCodec<S>,
     {
         let key = <SK as SeekKeyCodec<S>>::encode_seek_key(seek_key)?;
-        Ok(self.db_iter.seek(rocksdb::SeekKey::Key(&key)))
+        self.db_iter.seek(&key);
+        Ok(self.db_iter.valid())
     }
 
     /// Seeks to the last key whose binary representation is less than or equal to that of the
@@ -119,7 +124,8 @@ where
         SK: SeekKeyCodec<S>,
     {
         let key = <SK as SeekKeyCodec<S>>::encode_seek_key(seek_key)?;
-        Ok(self.db_iter.seek_for_prev(rocksdb::SeekKey::Key(&key)))
+        self.db_iter.seek_for_prev(&key);
+        Ok(self.db_iter.valid())
     }
 }
 
@@ -130,13 +136,25 @@ where
     type Item = Result<(S::Key, S::Value)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.db_iter.kv().map(|(raw_key, raw_value)| {
-            self.db_iter.next();
-            Ok((
-                <S::Key as KeyCodec<S>>::decode_key(&raw_key)?,
-                <S::Value as ValueCodec<S>>::decode_value(&raw_value)?,
-            ))
-        })
+        if self.db_iter.valid() {
+            Some((self.db_iter.key()?.to_vec(), self.db_iter.value()?.to_vec()))
+                .map(|(raw_key, raw_value)| {
+                self.db_iter.next();
+                Ok((
+                    <S::Key as KeyCodec<S>>::decode_key(&raw_key)?,
+                    <S::Value as ValueCodec<S>>::decode_value(&raw_value)?,
+                ))
+            })
+        } else {
+            None
+        }
+        // self.db_iter.kv().map(|(raw_key, raw_value)| {
+        //     self.db_iter.next();
+        //     Ok((
+        //         <S::Key as KeyCodec<S>>::decode_key(&raw_key)?,
+        //         <S::Value as ValueCodec<S>>::decode_value(&raw_value)?,
+        //     ))
+        // })
     }
 }
 
@@ -149,8 +167,8 @@ fn db_exists(path: &Path) -> bool {
 
 /// All the RocksDB methods return `std::result::Result<T, String>`. Since our methods return
 /// `failure::Result<T>`, manual conversion is needed.
-fn convert_rocksdb_err(msg: String) -> failure::Error {
-    format_err!("RocksDB internal error: {}.", msg)
+fn convert_rocksdb_err(err: rocksdb::Error) -> failure::Error {
+    format_err!("RocksDB internal error: {}.", err)
 }
 
 /// This DB is a schematized RocksDB wrapper where all data passed in and out are typed according to
@@ -164,11 +182,14 @@ impl DB {
     /// Create db with all the column families provided if it doesn't exist at `path`; Otherwise,
     /// try to open it with all the column families.
     pub fn open<P: AsRef<Path>>(path: P, mut cf_opts_map: ColumnFamilyOptionsMap) -> Result<Self> {
-        let mut db_opts = DBOptions::new();
+        let mut db_opts = Options::default();
 
         // If db exists, just open it with all cfs.
         if db_exists(path.as_ref()) {
-            return DB::open_cf(db_opts, &path, cf_opts_map.into_iter().collect());
+            return DB::open_cf(db_opts, &path, cf_opts_map.into_iter()
+                .map(|kv|{
+                    ColumnFamilyDescriptor::new(kv.0, kv.1)
+                }).collect());
         }
 
         // If db doesn't exist, create a db first with all column families.
@@ -176,44 +197,45 @@ impl DB {
 
         // For now we set the max total WAL size to be 1G. This config can be useful when column
         // families are updated at non-uniform frequencies.
-        db_opts.set_max_total_wal_size(1 << 30);
+        // db_opts.set_max_total_wal_size(1 << 30);
 
         let mut db = DB::open_cf(
             db_opts,
             path,
             vec![cf_opts_map
                 .remove_entry(&DEFAULT_CF_NAME)
+                .map(|kv|{
+                    ColumnFamilyDescriptor::new(kv.0, kv.1)
+                })
                 .ok_or_else(|| format_err!("No \"default\" column family name found"))?],
         )?;
         cf_opts_map
             .into_iter()
-            .map(|(cf_name, cf_opts)| db.create_cf((cf_name, cf_opts)))
+            .map(|(cf_name, cf_opts)| db.create_cf(cf_name, &cf_opts))
             .collect::<Result<Vec<_>>>()?;
         Ok(db)
     }
 
-    fn open_cf<'a, P, T>(opts: DBOptions, path: P, cfds: Vec<T>) -> Result<DB>
+    fn open_cf<P, T>(opts: Options, path: P, cfds: Vec<T>) -> Result<DB>
     where
         P: AsRef<Path>,
-        T: Into<ColumnFamilyDescriptor<'a>>,
+        T: Into<ColumnFamilyDescriptor>,
     {
-        let inner = rocksdb::DB::open_cf(
-            opts,
+        let inner = rocksdb::DB::open_cf_descriptors(
+            &opts,
             path.as_ref().to_str().ok_or_else(|| {
                 format_err!("Path {:?} can not be converted to string.", path.as_ref())
             })?,
-            cfds,
+            cfds.into_iter().map(|i|{i.into()}),
         )
         .map_err(convert_rocksdb_err)?;
 
         Ok(DB { inner })
     }
 
-    fn create_cf<'a, T>(&mut self, cfd: T) -> Result<()>
-    where
-        T: Into<ColumnFamilyDescriptor<'a>>,
+    fn create_cf<N: AsRef<str>>(&mut self, name: N, opts: &Options) -> Result<()>
     {
-        let _cf_handle = self.inner.create_cf(cfd).map_err(convert_rocksdb_err)?;
+        let _cf_handle = self.inner.create_cf(name, opts).map_err(convert_rocksdb_err)?;
         Ok(())
     }
 
@@ -243,12 +265,16 @@ impl DB {
     /// Returns a [`SchemaIterator`] on a certain schema.
     pub fn iter<S: Schema>(&self, opts: ReadOptions) -> Result<SchemaIterator<S>> {
         let cf_handle = self.get_cf_handle(S::COLUMN_FAMILY_NAME)?;
-        Ok(SchemaIterator::new(self.inner.iter_cf_opt(cf_handle, opts)))
+        let iter = self.inner.raw_iterator_cf_opt(cf_handle, &opts);
+        match iter {
+            Ok(iter)=>Ok(SchemaIterator::new(iter)),
+            Err(e) => Err(Error::from(e))
+        }
     }
 
     /// Writes a group of records wrapped in a [`SchemaBatch`].
     pub fn write_schemas(&self, batch: SchemaBatch) -> Result<()> {
-        let db_batch = rocksdb::WriteBatch::new();
+        let mut db_batch = rocksdb::WriteBatch::default();
         for (cf_name, key, write_op) in &batch.rows {
             let cf_handle = self.get_cf_handle(cf_name)?;
             match write_op {
@@ -259,11 +285,11 @@ impl DB {
         }
 
         self.inner
-            .write_opt(&db_batch, &default_write_options())
+            .write_opt(db_batch, &default_write_options())
             .map_err(convert_rocksdb_err)
     }
 
-    fn get_cf_handle(&self, cf_name: ColumnFamilyName) -> Result<&CFHandle> {
+    fn get_cf_handle(&self, cf_name: ColumnFamilyName) -> Result<&ColumnFamily> {
         self.inner.cf_handle(cf_name).ok_or_else(|| {
             format_err!(
                 "DB::cf_handle not found for column family name: {}",

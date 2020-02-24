@@ -71,7 +71,7 @@ impl ValueCodec<TestSchema2> for TestField {
 }
 
 fn open_db(dir: &tempfile::TempDir) -> DB {
-    let cf_opts_map: ColumnFamilyOptionsMap = [
+    let cf_opts_map: ColumnFamilyOptionsMap = vec![
         (DEFAULT_CF_NAME, ColumnFamilyOptions::default()),
         (
             TestSchema1::COLUMN_FAMILY_NAME,
@@ -82,8 +82,8 @@ fn open_db(dir: &tempfile::TempDir) -> DB {
             ColumnFamilyOptions::default(),
         ),
     ]
-    .iter()
-    .cloned()
+    .into_iter()
+    // .cloned()
     .collect();
     DB::open(&dir, cf_opts_map).expect("Failed to open DB.")
 }
